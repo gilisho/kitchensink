@@ -10,6 +10,20 @@ import { FilterServiceDefinition, type Filter } from "./filter-service";
 import { CategoryServiceDefinition } from "./category-service";
 import { SortServiceDefinition, type SortBy } from "./sort-service";
 
+const searchProducts = async (searchOptions: any) => {
+  const searchParams = {
+    filter: searchOptions.search?.filter,
+    sort: searchOptions.search?.sort,
+    ...(searchOptions.paging && { cursorPaging: searchOptions.paging })
+  };
+
+  const options = {
+    fields: searchOptions.fields || []
+  };
+
+  return await productsV3.searchProducts(searchParams, options);
+};
+
 export interface CollectionServiceAPI {
   products: Signal<productsV3.V3Product[]>;
   isLoading: Signal<boolean>;
@@ -21,19 +35,98 @@ export interface CollectionServiceAPI {
   refresh: () => Promise<void>;
 }
 
-// Helper to build query with supported filters only
-const buildQuery = () => {
-  let query = productsV3.queryProducts({
+// Helper to build search options with supported filters
+const buildSearchOptions = (filters?: Filter, selectedCategory?: string | null, sortBy?: SortBy) => {
+  const searchOptions: any = {
+    search: {},
     fields: [
-      "DESCRIPTION",
-      "MEDIA_ITEMS_INFO",
-      "VARIANT_OPTION_CHOICE_NAMES",
-      "CURRENCY",
-      "URL",
-      "ALL_CATEGORIES_INFO",
-    ],
-  });
-  return query;
+      'PLAIN_DESCRIPTION',
+      'MEDIA_ITEMS_INFO',
+      'CURRENCY',
+      'THUMBNAIL',
+      'URL',
+      'ALL_CATEGORIES_INFO'
+    ]
+  };
+
+  // Build filter conditions array
+  const filterConditions: any[] = [];
+
+  // Add category filter if selected
+  if (selectedCategory) {
+    filterConditions.push({
+      'allCategoriesInfo.categories': {
+        $matchItems: [
+          {
+            id: {
+              $in: [selectedCategory],
+            },
+          },
+        ],
+      },
+    });
+  }
+
+  // Add price range filter if provided
+  if (filters?.priceRange) {
+    const { min, max } = filters.priceRange;
+    if (min > 0) {
+      filterConditions.push({
+        "actualPriceRange.minValue.amount": { "$gte": min.toString() }
+      });
+    }
+    if (max < 999999) {
+      filterConditions.push({
+        "actualPriceRange.maxValue.amount": { "$lte": max.toString() }
+      });
+    }
+  }
+
+  // Add product options filter if provided
+  if (filters?.selectedOptions && Object.keys(filters.selectedOptions).length > 0) {
+    for (const [optionId, choiceIds] of Object.entries(filters.selectedOptions)) {
+      if (choiceIds.length > 0) {
+        filterConditions.push({
+          "options.choicesSettings.choices.choiceId": {
+            "$hasSome": choiceIds
+          }
+        });
+      }
+    }
+  }
+
+  // Apply filters
+  if (filterConditions.length > 0) {
+    if (filterConditions.length === 1) {
+      // Single condition - no need for $and wrapper
+      searchOptions.search.filter = filterConditions[0];
+    } else {
+      // Multiple conditions - use $and
+      searchOptions.search.filter = {
+        $and: filterConditions
+      };
+    }
+  }
+
+  // Add sort if provided
+  if (sortBy) {
+    switch (sortBy) {
+      case 'name-asc':
+        searchOptions.search.sort = [{ fieldName: 'name', order: 'ASC' }];
+        break;
+      case 'name-desc':
+        searchOptions.search.sort = [{ fieldName: 'name', order: 'DESC' }];
+        break;
+      case 'price-asc':
+        searchOptions.search.sort = [{ fieldName: 'actualPriceRange.minValue.amount', order: 'ASC' }];
+        break;
+      case 'price-desc':
+        searchOptions.search.sort = [{ fieldName: 'actualPriceRange.minValue.amount', order: 'DESC' }];
+        break;
+    }
+  }
+
+  return searchOptions;
 };
 
 export const CollectionServiceDefinition =
@@ -42,7 +135,6 @@ export const CollectionServiceDefinition =
 export const CollectionService = implementService.withConfig<{
   initialProducts?: productsV3.V3Product[];
   pageSize?: number;
-  collectionId?: string;
   initialCursor?: string;
   initialHasMore?: boolean;
 }>()(CollectionServiceDefinition, ({ getService, config }) => {
@@ -74,89 +166,6 @@ export const CollectionService = implementService.withConfig<{
   const pageSize = config.pageSize || 12;
   let allProducts: productsV3.V3Product[] = initialProducts;
 
-  // Helper to apply client-side filtering since the API doesn't support all filter types
-  const applyClientSideFilters = (
-    products: productsV3.V3Product[],
-    filters: Filter,
-    selectedCategory: string | null,
-    sortBy: SortBy
-  ): productsV3.V3Product[] => {
-    const filteredProducts = products.filter((product) => {
-      if (
-        selectedCategory &&
-        !product.allCategoriesInfo?.categories?.some(
-          (cat: any) => cat._id === selectedCategory
-        )
-      ) {
-        return false;
-      }
-      // Check price range
-      const productPrice =
-        product.actualPriceRange?.minValue?.amount ||
-        product.actualPriceRange?.maxValue?.amount;
-
-      if (productPrice) {
-        const price = parseFloat(productPrice);
-        if (price < filters.priceRange.min || price > filters.priceRange.max) {
-          return false;
-        }
-      }
-
-      // Check product options
-      if (Object.keys(filters.selectedOptions).length > 0) {
-        for (const [optionId, choiceIds] of Object.entries(
-          filters.selectedOptions
-        )) {
-          if (choiceIds.length === 0) continue;
-
-          const productOption = product.options?.find(
-            (opt) => opt._id === optionId
-          );
-          if (!productOption) return false;
-
-          const productChoices =
-            productOption.choicesSettings?.choices?.map((c) => c.choiceId) ||
-            [];
-          const hasMatchingChoice = choiceIds.some((choiceId) =>
-            productChoices.includes(choiceId)
-          );
-
-          if (!hasMatchingChoice) return false;
-        }
-      }
-
-      return true;
-    });
-    return filteredProducts.sort((a, b) => {
-      switch (sortBy) {
-        case "name-asc":
-          return (a.name || "").localeCompare(b.name || "");
-        case "name-desc":
-          return (b.name || "").localeCompare(a.name || "");
-        case "price-asc": {
-          const priceA = parseFloat(
-            a.actualPriceRange?.minValue?.amount || "0"
-          );
-          const priceB = parseFloat(
-            b.actualPriceRange?.minValue?.amount || "0"
-          );
-          return priceA - priceB;
-        }
-        case "price-desc": {
-          const priceA = parseFloat(
-            a.actualPriceRange?.minValue?.amount || "0"
-          );
-          const priceB = parseFloat(
-            b.actualPriceRange?.minValue?.amount || "0"
-          );
-          return priceB - priceA;
-        }
-        default:
-          return 0;
-      }
-    });
-  };
-
   const loadMore = async () => {
     // Don't load more if there are no more products available
     if (!hasMoreProducts.get()) {
@@ -167,44 +176,41 @@ export const CollectionService = implementService.withConfig<{
       isLoading.set(true);
       error.set(null);
 
-      let query = buildQuery();
-      if (nextCursor) {
-        query = query.skipTo(nextCursor);
-      }
+      const filters = collectionFilters.currentFilters.get();
+      const selectedCategory = categoryService.selectedCategory.get();
+      const sortBy = sortService.currentSort.get();
+      const searchOptions = buildSearchOptions(filters, selectedCategory, sortBy);
 
-      // Apply cursor pagination if we have a next cursor
+      // Add pagination
+      searchOptions.paging = { limit: pageSize };
       if (nextCursor) {
-        query = query.skipTo(nextCursor);
+        searchOptions.paging.cursor = nextCursor;
       }
 
       const currentProducts = productsList.get();
-      const selectedCategory = categoryService.selectedCategory.get();
-      const productResults = await query.limit(pageSize).find();
+      const productResults = await searchProducts(searchOptions);
 
       // Update cursor for next pagination
-      nextCursor = productResults.cursors?.next || undefined;
+      nextCursor = productResults.pagingMetadata?.cursors?.next || undefined;
 
       // Check if there are more products to load
       const hasMore = Boolean(
         nextCursor &&
-          productResults.items &&
-          productResults.items.length === pageSize
+          productResults.products &&
+          productResults.products.length === pageSize
       );
       hasMoreProducts.set(hasMore);
 
-      const newProducts = [...currentProducts, ...(productResults.items || [])];
-      const filters = collectionFilters.currentFilters.get();
-      const sortBy = sortService.currentSort.get();
-      const filteredProducts = applyClientSideFilters(
-        allProducts,
-        filters,
-        selectedCategory,
-        sortBy
-      );
+      // Update allProducts with the new data
+      allProducts = [...allProducts, ...(productResults.products || []
+      )];
 
-      productsList.set(filteredProducts);
-      totalProducts.set(newProducts.length);
-      hasProducts.set(newProducts.length > 0);
+      // All filtering is handled server-side
+      const newProducts = productResults.products || [];
+
+      productsList.set([...currentProducts, ...newProducts]);
+      totalProducts.set(currentProducts.length + newProducts.length);
+      hasProducts.set((currentProducts.length + newProducts.length) > 0);
     } catch (err) {
       error.set(
         err instanceof Error ? err.message : "Failed to load more products"
@@ -219,35 +225,35 @@ export const CollectionService = implementService.withConfig<{
       isLoading.set(true);
       error.set(null);
 
-      const query = buildQuery();
-      const productResults = await query.limit(pageSize).find();
+      const filters = collectionFilters.currentFilters.get();
       const selectedCategory = categoryService.selectedCategory.get();
+      const sortBy = sortService.currentSort.get();
+      const searchOptions = buildSearchOptions(filters, selectedCategory, sortBy);
+
+      // Add pagination
+      searchOptions.paging = { limit: pageSize };
+
+      const productResults = await searchProducts(searchOptions);
 
       // Reset pagination state
-      nextCursor = productResults.cursors?.next || undefined;
+      nextCursor = productResults.pagingMetadata?.cursors?.next || undefined;
       const hasMore = Boolean(
-        productResults.cursors?.next &&
-          productResults.items &&
-          productResults.items.length === pageSize
+        productResults.pagingMetadata?.cursors?.next &&
+          productResults.products &&
+          productResults.products.length === pageSize
       );
       hasMoreProducts.set(hasMore);
 
-      const filters = collectionFilters.currentFilters.get();
-      const sortBy = sortService.currentSort.get();
-      const filteredProducts = applyClientSideFilters(
-        productResults.items || [],
-        filters,
-        selectedCategory,
-        sortBy
-      );
+      // Update allProducts with the new data
+      allProducts = productResults.products || [];
 
-      productsList.set(filteredProducts);
+      // All filtering is handled server-side
+      productsList.set(allProducts);
       if (setTotalProducts) {
-        totalProducts.set(filteredProducts.length);
+        totalProducts.set(allProducts.length);
       }
 
-      totalProducts.set((productResults.items || []).length);
-      hasProducts.set((productResults.items || []).length > 0);
+      hasProducts.set(allProducts.length > 0);
     } catch (err) {
       error.set(
         err instanceof Error ? err.message : "Failed to refresh products"
@@ -257,7 +263,9 @@ export const CollectionService = implementService.withConfig<{
     }
   };
 
+  // Refresh with server-side filtering when any filters change
   collectionFilters.currentFilters.subscribe(() => {
+    // All filtering (categories, price, options) is now handled server-side
     refresh(false);
   });
 
@@ -281,29 +289,27 @@ export const CollectionService = implementService.withConfig<{
   };
 });
 
-export async function loadCollectionServiceConfig(
-  collectionId?: string
-): Promise<
+export async function loadCollectionServiceConfig(): Promise<
   ServiceFactoryConfig<typeof CollectionService> & {
     initialCursor?: string;
     initialHasMore?: boolean;
   }
 > {
   try {
-    // Query products with ALL_CATEGORIES_INFO field as required for category filtering
-    let query = buildQuery();
+    const searchOptions = buildSearchOptions();
+    const pageSize = 12;
+    searchOptions.paging = { limit: pageSize };
 
-    const productResults = await query.limit(100).find();
+    const productResults = await searchProducts(searchOptions);
 
     return {
-      initialProducts: productResults.items || [],
-      pageSize: 100,
-      collectionId,
-      initialCursor: productResults.cursors?.next || undefined,
+      initialProducts: productResults.products || [],
+      pageSize,
+      initialCursor: productResults.pagingMetadata?.cursors?.next || undefined,
       initialHasMore: Boolean(
-        productResults.cursors?.next &&
-          productResults.items &&
-          productResults.items.length === 12
+        productResults.pagingMetadata?.cursors?.next &&
+          productResults.products &&
+          productResults.products.length === pageSize
       ),
     };
   } catch (error) {
@@ -311,7 +317,6 @@ export async function loadCollectionServiceConfig(
     return {
       initialProducts: [],
       pageSize: 12,
-      collectionId,
       initialHasMore: false,
     };
   }

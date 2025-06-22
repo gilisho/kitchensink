@@ -107,7 +107,7 @@ export const FilteredItem: React.FC<FilteredItemProps> = ({
   const price =
     product.actualPriceRange?.minValue?.formattedAmount ||
     product.actualPriceRange?.maxValue?.formattedAmount ||
-    "$0.00";
+    (product.actualPriceRange?.minValue?.amount ? `$${product.actualPriceRange.minValue.amount}` : "$0.00");
   const available = product.inventory?.availabilityStatus === "IN_STOCK";
   const href = `/store/products/${String(product.slug || product._id || "")}`;
   const description = product.plainDescription
