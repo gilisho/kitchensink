@@ -382,35 +382,31 @@ export async function loadSelectedVariantServiceConfig(
   productSlug: string
 ): Promise<ServiceFactoryConfig<typeof SelectedVariantService>> {
   try {
-    const storeProducts = await productsV3
-      .queryProducts()
-      .eq("slug", productSlug)
-      .find();
-
-    if (!storeProducts.items?.[0]) {
-      throw new Error("Product not found");
-    }
-
-    const productId = storeProducts.items[0]._id;
-    if (!productId) {
-      throw new Error("Product ID not found");
-    }
-
-    const fullProduct = await productsV3.getProduct(productId, {
+    // Use getProductBySlug directly - single API call with comprehensive fields
+    const productResponse = await productsV3.getProductBySlug(productSlug, {
       fields: [
-        "MEDIA_ITEMS_INFO" as any,
-        "CURRENCY" as any,
         "DESCRIPTION" as any,
+        "DIRECT_CATEGORIES_INFO" as any,
+        "BREADCRUMBS_INFO" as any,
+        "INFO_SECTION" as any,
+        "MEDIA_ITEMS_INFO" as any,
         "PLAIN_DESCRIPTION" as any,
+        "THUMBNAIL" as any,
+        "URL" as any,
         "VARIANT_OPTION_CHOICE_NAMES" as any,
+        "WEIGHT_MEASUREMENT_UNIT_INFO" as any,
       ],
     });
 
+    if (!productResponse.product) {
+      throw new Error("Product not found");
+    }
+
     return {
-      product: fullProduct,
+      product: productResponse.product,
     };
   } catch (error) {
-    console.error("Failed to load product:", error);
+    console.error(`Failed to load product for slug "${productSlug}":`, error);
     throw error;
   }
 }
